@@ -475,7 +475,7 @@ async def run_action_node(
             await run_extraction_action(
                 action_node.extraction_action, memory, browser, task
             )
-            node_outcome = "deterministic"
+            node_outcome = "llm"
         elif action_node.python_script_action:
             await run_python_script_action(
                 action_node.python_script_action, memory, browser, task
@@ -493,30 +493,38 @@ async def run_action_node(
             await run_assertion_action(
                 action_node.assertion_action, memory, browser, task
             )
-            node_outcome = "deterministic"
+            node_outcome = "assertion_pass"
         elif action_node.captcha_action:
             await handle_captcha_action(action_node.captcha_action, browser, memory)
-            node_outcome = "deterministic"
+            node_outcome = "captcha"
         elif action_node.human_in_loop_action:
             await run_human_in_loop_action(
                 action_node.human_in_loop_action, task, memory
             )
-            node_outcome = "deterministic"
+            node_outcome = "human_in_loop"
         elif action_node.dynamic_form_mapping_action:
             await run_dynamic_form_mapping_action(
                 action_node.dynamic_form_mapping_action, task, memory, browser
             )
-            node_outcome = "deterministic"
+            node_outcome = "llm"
         elif action_node.misc_action:
             misc = action_node.misc_action
             if misc.set_variable:
                 await run_set_variable_action(misc.set_variable, memory)
+                node_outcome = "deterministic"
             elif misc.llm_query:
                 await run_llm_query_action(misc.llm_query, memory, task)
+                node_outcome = "llm"
             elif misc.count_locator:
                 await run_count_locator_action(misc.count_locator, memory, browser)
-            node_outcome = "deterministic"
+                node_outcome = "deterministic"
+            else:
+                node_outcome = "deterministic"
 
+    except AssertionError as e:
+        node_outcome = "assertion_fail"
+        logger.error(f"Assertion failed at node {memory.automation_state.step_index}: {e}")
+        raise e
     except Exception as e:
         node_outcome = "failed"
         logger.error(f"Error running node {memory.automation_state.step_index}: {e}")

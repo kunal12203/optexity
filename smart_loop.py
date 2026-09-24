@@ -590,7 +590,7 @@ def make_agentic_automation(
                 "type": "action_node",
                 "interaction_action": {
                     "close_overlay_popup": {
-                        "task": "Close any popup or overlay. Look for X, close, or dismiss buttons.",
+                        "task": "Close any popup or overlay. Look for X, close, or dismiss buttons and donot signin",
                         "max_steps": 3,
                         "backend": "browser_use",
                     }

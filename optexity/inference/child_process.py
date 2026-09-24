@@ -34,6 +34,8 @@ from optexity.inference.core.logging import (
     save_trajectory_in_server,
     start_task_in_server,
 )
+from optexity.schema.automation import Automation
+
 from optexity.inference.infra.actual_browser import ActualBrowser
 from optexity.inference.infra.browser_health import consume_browser_restart_request
 from optexity.schema.enums import ExitCodes
@@ -589,6 +591,12 @@ async def task_processor():
                 fetch_success = task.automation is not None
                 if not fetch_success:
                     automation_error = "Task allocated without an automation"
+
+
+            # with open("test_automation.json", "r") as f:
+            #     automation = json.load(f)
+            #     automation = Automation.model_validate(automation)
+            # task.automation = automation
 
             override_env = os.environ.get("OPTEXITY_LOCAL_AUTOMATION", "test_automation.json")
             if override_env:

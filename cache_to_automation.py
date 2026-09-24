@@ -71,6 +71,12 @@ def _fuzzy_match(param_val: str, text: str) -> bool:
 def _substitute_value(text: str, reverse_map: dict[str, str]) -> str:
     """Replace literal values with variable references.
 
+     "John"      → exact match   → "{first_name[0]}"   ✓
+  "John Doe"  → exact match   → "{full_name[0]}"     ✓
+  "Mr. John"  → substring     → "Mr. {first_name[0]}" (replaces "John" inside)
+  "Johnny"    → token overlap → "{first_name[0]}"    (60% token match)
+  
+
     Tries exact match first, then substring replacement (keeping surrounding
     text), then token-overlap full replacement as a last resort.
     """
@@ -118,6 +124,11 @@ def _escape(s: str) -> str:
 
 def _build_locator_command(element: dict) -> str | None:
     """Build a Playwright locator command from cached element info.
+ data-test    →  locator('[data-test="..."]')       most stable
+  data-testid  →  locator('[data-testid="..."]')
+  id (stable)  →  locator('#id')                     skips if looks like UUID/random
+  name         →  locator('[name="02frstname"]')      ← roboform uses this
+  placeholder  →  get_by_placeholder("...")
 
     Priority: data-test > id (stable) > name > placeholder > role+ax_name > aria-label > xpath.
     Locators use captured values directly (no variable substitution) so
