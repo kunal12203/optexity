@@ -161,6 +161,9 @@ Convert the following browser action cache into a valid Optexity automation JSON
 {actions_str}
 
 ## Rules
+0. Set `max_tries: 2` on every node. Nodes are unproven — fail fast so the
+   prompt/agentic fallback layers take over quickly instead of retrying 10×.
+   Exception: if a node has `skip_command: true`, max_tries does not matter.
 1. Map each action to ONE node with the matching interaction_action type.
 2. Use stable Playwright locators in `command`:
    - Prefer: data-testid > id > name > placeholder > role+ax_name > aria-label > xpath
@@ -173,6 +176,19 @@ Convert the following browser action cache into a valid Optexity automation JSON
 7. Set `optional: true` on popup/overlay dismiss nodes.
 8. For scroll actions use {{"down": true}} or {{"down": false}}.
 9. The `url` field must be the start URL.
+10. For `send_keys` actions: map to `input_text` with `command: "locator('body')"`,
+    `fill_or_type: "key_press"`, and `input_text` set to the EXACT key string from
+    `action_params.keys` (e.g. `"Escape"`, `"Enter"`, `"Tab"`). Never leave `input_text`
+    empty for a send_keys action.
+11. For `navigate` actions: SKIP — do not create a node for navigation/redirect
+    actions (they are side-effects of other actions, not independent steps).
+    Exception: the very first navigate to the start URL is already handled by `url`.
+12. For `evaluate` actions: SKIP — do not create nodes for JS evaluation actions.
+13. For date-picker / calendar cell clicks where the element `ax_name` contains a
+    specific date string (e.g. "Fri Sep 25 2026"): set `skip_command: true` (so the
+    command layer is skipped) and write `prompt_instructions` describing the action
+    using parameter refs, e.g. "Click the check-in date {{checkin_date[0]}} on the calendar".
+    Do NOT hardcode the date string in `command`.
 
 Return ONLY a valid JSON object.
 """
@@ -233,13 +249,178 @@ def _extract_json(text: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def _validate(data: dict) -> tuple[object | None, str | None]:
-    """Validate against Automation schema.  Returns (instance, None) or (None, error)."""
+    """Validate against Automation schema.  Returns (instance, None) or (None, error).
+
+    Also handles the common LLM mistake of nesting nodes under an 'automation' key
+    instead of placing them at the top level.
+    """
     from optexity.schema.automation import Automation
 
+    # Unwrap {"automation": {"nodes": [...]}} if the LLM added an extra wrapper key
+    if "nodes" not in data and "automation" in data and isinstance(data["automation"], dict):
+        nested = data["automation"]
+        if "nodes" in nested:
+            data = {k: v for k, v in data.items() if k != "automation"}
+            data.update(nested)
+
     try:
-        return Automation.model_validate(data), None
+        instance = Automation.model_validate(data)
+        # Guard against silent empty-node success — nodes must be present
+        if len(instance.nodes) == 0:
+            return None, "Automation has 0 nodes — nodes list must not be empty."
+        return instance, None
     except Exception as e:
         return None, str(e)[:800]
+
+
+# ---------------------------------------------------------------------------
+# Outcome-driven improver — for round > 0
+# ---------------------------------------------------------------------------
+
+_IMPROVE_SYSTEM = """\
+You are an expert at making browser-automation scripts more deterministic.
+You receive a current Optexity automation JSON plus per-node evidence of what
+happened during the last run.  Your job is to improve nodes that are NOT yet
+command_success or deterministic, using the evidence provided.
+Return ONLY valid JSON — no prose, no markdown fences."""
+
+
+def _build_improve_prompt(
+    current_auto: dict,
+    node_evidence: list[dict],
+    schema_str: str,
+    prior_error: str | None = None,
+) -> str:
+    """Build the outcome-driven improvement prompt.
+
+    node_evidence is a list of dicts, one per non-deterministic node:
+      {
+        "node": int,
+        "outcome": "prompt_fallback" | "agentic" | "failed",
+        "error": str | None,        # command-layer error message
+        "winning_locator": str | None,  # LLM locator that worked (prompt_fallback)
+        "winning_actions": list[dict],  # actions the agentic actually took (agentic)
+      }
+    """
+    evidence_lines = []
+    for e in node_evidence:
+        parts = [f"node {e['node']} outcome={e['outcome']}"]
+        if e.get("error"):
+            parts.append(f"command_error: {e['error'][:150]}")
+        if e.get("winning_locator"):
+            parts.append(f"winning_locator: {e['winning_locator']}")
+        if e.get("winning_actions"):
+            acts = e["winning_actions"][:3]  # show first 3 actions
+            acts_compact = [
+                {
+                    "type": a.get("action_type"),
+                    "el_id": (a.get("element") or {}).get("attributes", {}).get("id", ""),
+                    "el_testid": (a.get("element") or {}).get("attributes", {}).get("data-testid", ""),
+                    "el_placeholder": (a.get("element") or {}).get("attributes", {}).get("placeholder", ""),
+                    "el_ax": (a.get("element") or {}).get("ax_name", "")[:40],
+                    "text": a.get("action_params", {}).get("text", ""),
+                    "keys": a.get("action_params", {}).get("keys", ""),
+                }
+                for a in acts
+            ]
+            parts.append(f"winning_actions: {json.dumps(acts_compact)}")
+        evidence_lines.append("  " + " | ".join(parts))
+
+    evidence_str = "\n".join(evidence_lines) if evidence_lines else "  (none)"
+
+    repair_block = ""
+    if prior_error:
+        repair_block = f"\nPrevious attempt was invalid. Validation error:\n{prior_error}\nFix it.\n"
+
+    return f"""{repair_block}
+Improve the following Optexity automation JSON so that non-deterministic nodes
+become deterministic.  Use the evidence below to guide each fix.
+
+## Schema
+{schema_str}
+
+## Current automation
+{json.dumps(current_auto, indent=2)}
+
+## Evidence per non-deterministic node
+{evidence_str}
+
+## General rules
+- Set `max_tries: 2` on all nodes you modify or add. Fail fast — let prompt/agentic
+  layers take over quickly rather than retrying 10× on a wrong locator.
+- Nodes that already have outcome=command_success or deterministic: do NOT change them,
+  including their max_tries.
+
+## How to use the evidence
+- outcome=failed, error contains "covered by another element" OR "intercepts pointer events" OR "Timeout" (element resolved but blocked):
+    → Also set force: true on the failing click node.
+    → If it's a coverage/overlap issue, also insert an optional Escape key-press node BEFORE the failing node
+      (command: locator('body'), fill_or_type: key_press, input_text: Escape, optional: true)
+- outcome=failed, error contains "strict mode violation" or "resolved to N elements":
+    → Append .nth(0) to the command locator.
+- outcome=failed, error contains "not found" or "timeout":
+    → Replace command with a more stable locator derived from winning_actions elements
+      (prefer id > data-testid > placeholder > aria-label > role+name).
+- outcome=prompt_fallback, winning_locator provided:
+    → Replace the node's command with that winning_locator exactly.
+- outcome=agentic, winning_actions provided:
+    → Rebuild the node using the first meaningful action's element attributes
+      to form a stable Playwright locator.
+    → For send_keys actions in winning_actions: add an input_text key_press node.
+    → For date-picker clicks (ax_name looks like a calendar date): set skip_command: true,
+      write prompt_instructions with parameter refs instead of hardcoded dates.
+- For any SEARCH / SUBMIT / final form-submit button: set force: true.
+
+## Critical structural rules
+- REPLACE failing nodes in place — do NOT append new nodes for goals already served by existing nodes.
+- If two nodes in the current automation serve the same goal (e.g., two city-input nodes), keep only the better one and remove the duplicate.
+- NEVER hardcode dates or specific text in locator commands (e.g., has_text="Mon Sep 28 2026"). Any calendar/date-picker click MUST use skip_command: true and parameter refs in prompt_instructions.
+
+Return the COMPLETE improved automation JSON (all nodes, including unchanged ones).
+"""
+
+
+def llm_improve(
+    current_auto: dict,
+    node_evidence: list[dict],
+) -> dict:
+    """Improve a current automation using per-node outcome evidence.
+
+    node_evidence: list from build_node_evidence().
+    Returns improved automation dict.  Falls back to current_auto on failure.
+    """
+    if not node_evidence:
+        return current_auto  # nothing to improve
+
+    schema_str = _get_focused_schema()
+    prior_error: str | None = None
+
+    for attempt in range(MAX_REPAIR + 1):
+        if attempt > 0:
+            logger.info(f"[LLM improver] repair attempt {attempt}/{MAX_REPAIR}")
+
+        prompt = _build_improve_prompt(current_auto, node_evidence, schema_str, prior_error)
+        try:
+            raw = _call_llm(prompt)
+        except Exception as e:
+            logger.error(f"[LLM improver] LLM call failed: {e}")
+            break
+
+        data = _extract_json(raw)
+        if data is None:
+            prior_error = "Response did not contain a valid JSON object."
+            continue
+
+        instance, error = _validate(data)
+        if instance is not None:
+            logger.info(f"[LLM improver] validated on attempt {attempt}")
+            return instance.model_dump(mode="json", exclude_none=True)
+
+        prior_error = error
+        logger.warning(f"[LLM improver] attempt {attempt}: {error}")
+
+    logger.warning("[LLM improver] all attempts failed — returning current automation unchanged.")
+    return current_auto
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +470,9 @@ def llm_convert(
         instance, error = _validate(data)
         if instance is not None:
             logger.info(f"[LLM builder] validated on attempt {attempt}")
-            return data
+            # Return the instance serialized back to dict so any unwrapping done
+            # in _validate (e.g. nested "automation" key) is reflected in output.
+            return instance.model_dump(mode="json", exclude_none=True)
 
         prior_error = error
         logger.warning(f"[LLM builder] attempt {attempt}: validation failed — {error}")

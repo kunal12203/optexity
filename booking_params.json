@@ -1,0 +1,13 @@
+{
+  "input_parameters": {
+    "destination_city": ["Gurgaon"],
+    "check_in_date": ["Sunday, 05 October"],
+    "check_out_date": ["Wednesday, 08 October"],
+    "number_of_rooms": ["1"],
+    "first_name": ["John"],
+    "last_name": ["Doe"],
+    "email_address": ["john.doe@example.com"],
+    "phone_number": ["5551234567"],
+    "arrival_time_slot": ["1"]
+  }
+}
