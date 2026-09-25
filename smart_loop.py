@@ -692,6 +692,126 @@ def _read_top_locator_score(task_dir: Path, node_idx: int) -> int | None:
     return 0  # file exists but unreadable → treat as worst case
 
 
+def _audit_nodes(
+    task_goal: str,
+    automation: dict,
+    input_parameters: dict,
+    task_dir: Path,
+    outcomes: list[dict],
+) -> dict[int, dict]:
+    """Classify each non-agentic node as correct/irrelevant/wrong_target/redundant.
+
+    Single LLM call per round. Returns {node_idx: {"classification": str, "reason": str}}.
+    Returns empty dict on failure (non-critical path).
+    """
+    outcome_by_node = {o["node"]: o["outcome"] for o in outcomes}
+    nodes = automation.get("nodes", [])
+
+    node_summaries = []
+    for idx, node in enumerate(nodes):
+        ia = node.get("interaction_action", {})
+        if "agentic_task" in ia or "close_overlay_popup" in ia:
+            continue
+
+        # Read what action this node performs
+        action_desc = ""
+        for atype in ("click_element", "input_text", "select_option", "scroll", "go_to_url", "key_press"):
+            action = ia.get(atype)
+            if isinstance(action, dict):
+                hint = action.get("prompt_instructions", "")
+                cmd = action.get("command", "")
+                text = action.get("input_text", "")
+                action_desc = f"{atype}: {hint or cmd}"
+                if text:
+                    action_desc += f" value='{text}'"
+                break
+            elif atype == "scroll" and action is not None:
+                action_desc = f"scroll {'down' if ia.get('scroll', {}).get('down') else 'up'}"
+                break
+
+        # Read URL from state.json
+        url = ""
+        state_path = task_dir / "logs" / f"step_{idx}" / "state.json"
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(errors="replace"))
+                url = state.get("url", "")
+            except Exception:
+                pass
+
+        outcome = outcome_by_node.get(idx, "unknown")
+        node_summaries.append(f"  node {idx}: {action_desc} | url={url} | outcome={outcome}")
+
+    if not node_summaries:
+        return {}
+
+    params_str = json.dumps(input_parameters, separators=(",", ":"))
+    summaries_str = "\n".join(node_summaries)
+
+    prompt = f"""Audit these automation nodes against the task goal.
+
+## Task goal
+"{task_goal}"
+
+## Input parameters (correct values the automation should use)
+{params_str}
+
+## Nodes
+{summaries_str}
+
+## Classify each node as one of:
+- correct: contributes to the task with the right target
+- irrelevant: doesn't contribute to the task at all (e.g. clicking unrelated links)
+- wrong_target: right type of action but targets wrong element/value (e.g. selecting wrong city)
+- redundant: duplicates another node's action
+
+Return ONLY a JSON object mapping node index to classification and reason:
+{{"0": {{"c": "irrelevant", "r": "clicking mobile number input is not part of hotel search"}}, "3": {{"c": "correct", "r": "inputs destination city"}}}}
+Keep reasons under 15 words. Only include nodes that are NOT correct."""
+
+    try:
+        import litellm
+        model = os.environ.get("LLM_CONVERTER_MODEL") or os.environ.get("LLM_MODEL", "openai/gpt-4.1")
+        resp = litellm.completion(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You audit browser automation nodes. Return only JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=1024,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+
+        # Extract JSON from response
+        if raw.startswith("```"):
+            import re
+            m = re.search(r"```(?:json)?\s*(\{.*?})\s*```", raw, re.DOTALL)
+            if m:
+                raw = m.group(1)
+        data = json.loads(raw)
+
+        result: dict[int, dict] = {}
+        for key, val in data.items():
+            try:
+                idx = int(key)
+                classification = val.get("c", "correct")
+                reason = val.get("r", "")
+                if classification != "correct":
+                    result[idx] = {"classification": classification, "reason": reason}
+            except (ValueError, AttributeError):
+                continue
+
+        if result:
+            logger.info(f"Node audit flagged {len(result)} nodes: "
+                        + str({k: v['classification'] for k, v in result.items()}))
+        return result
+
+    except Exception as e:
+        logger.warning(f"Node audit failed ({type(e).__name__}): {e}")
+        return {}
+
+
 def _evaluate_task_completion(
     original_task: str,
     automation: dict,
@@ -852,6 +972,9 @@ def run_loop(
     output_dir: str = ".",
     resume_from_round: int | None = None,
 ) -> dict | None:
+    import dotenv
+    dotenv.load_dotenv(env_path, override=True)
+
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
 
@@ -1008,8 +1131,31 @@ def run_loop(
                     + str([f"n{e['node']}={e['outcome']}" for e in node_evidence])
                 )
 
-            # Always improve the full automation starting from the original URL.
-            # Proven nodes keep their state; the LLM only touches non-deterministic ones.
+            # Audit all nodes for wrong-path behavior (irrelevant, wrong target, redundant).
+            # Merges flagged proven nodes into evidence so llm_improve can fix them.
+            outcome_by_node = {o["node"]: o["outcome"] for o in outcomes}
+            audit = _audit_nodes(agentic_task, current_automation, input_parameters, task_dir, outcomes)
+            evidence_node_set = {e["node"] for e in node_evidence}
+            for node_idx, result in audit.items():
+                if node_idx in evidence_node_set:
+                    # Already in evidence — just add audit fields
+                    for e in node_evidence:
+                        if e["node"] == node_idx:
+                            e["audit"] = result["classification"]
+                            e["audit_reason"] = result["reason"]
+                            break
+                else:
+                    # Proven node flagged by audit — add new evidence entry
+                    node_evidence.append({
+                        "node": node_idx,
+                        "outcome": outcome_by_node.get(node_idx, "unknown"),
+                        "audit": result["classification"],
+                        "audit_reason": result["reason"],
+                        "error": None,
+                        "winning_locator": None,
+                        "winning_actions": [],
+                    })
+
             next_auto = llm_improve(current_automation, node_evidence)
 
             # Remove the existing trailing agentic (last agentic node at end)

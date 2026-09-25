@@ -431,7 +431,10 @@ _EVIDENCE_RULES = """## Evidence → fix mapping
 - outcome=prompt_fallback + winning_locator → use that locator as the command.
 - outcome=agentic + winning_actions → rebuild locator from first action's element attributes.
 - date-picker actions → skip_command: true, param refs in prompt_instructions.
-- submit/search buttons → set force: true."""
+- submit/search buttons → set force: true.
+- AUDIT: irrelevant → REMOVE the node entirely (it doesn't contribute to the task).
+- AUDIT: wrong_target → fix the command to target the correct element/value per input_parameters.
+- AUDIT: redundant → REMOVE the node (it duplicates another node's action)."""
 
 
 def _build_improve_prompt_fn(
@@ -458,6 +461,8 @@ def _build_improve_prompt_fn(
                 for a in e["winning_actions"][:3]
             ]
             parts.append(f"actions: {json.dumps(acts_compact, separators=(',', ':'))}")
+        if e.get("audit"):
+            parts.append(f"AUDIT: {e['audit']} — {e.get('audit_reason', '')}")
         evidence_lines.append("  " + " | ".join(parts))
 
     evidence_str = "\n".join(evidence_lines) if evidence_lines else "  (none)"
@@ -482,11 +487,13 @@ def _build_improve_prompt_fn(
 {_EVIDENCE_RULES}
 
 ## Structural rules
-- Set `max_tries: 2` on modified nodes. Don't touch nodes with outcome=command_success or deterministic.
+- Set `max_tries: 2` on modified nodes.
+- Don't touch nodes with outcome=command_success or deterministic UNLESS they have an AUDIT flag.
 - REPLACE failing nodes in place — no duplicates for the same goal.
+- REMOVE nodes flagged AUDIT: irrelevant or AUDIT: redundant — do NOT include them in output.
 - NEVER hardcode dates in locators. Use skip_command: true + param refs.
 
-Return the COMPLETE automation JSON (all nodes, including unchanged ones)."""
+Return the COMPLETE automation JSON (all nodes, including unchanged ones — minus removed nodes)."""
 
     return prompt_fn
 
