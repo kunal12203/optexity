@@ -574,11 +574,46 @@ def find_merged_cache(task_dir: Path) -> Path | None:
 # Round 0: build initial 2-node agentic automation
 # ---------------------------------------------------------------------------
 
+def _enrich_task_with_params(task: str, input_parameters: dict) -> str:
+    """Append the resolved input parameter values to any agentic task description.
+
+    Without this, a vague instruction like "find the cheapest hotel and book it"
+    gives the agent no concrete values to fill in — it will invent a destination,
+    pick arbitrary dates, and use placeholder names.  Appending the actual values
+    from input_parameters gives the agent a ground truth it must use when it
+    encounters form fields, date pickers, or name inputs on the page.
+
+    The output looks like:
+        <original task>
+
+        Use these exact values when filling in any form fields:
+          destination city: Gurgaon
+          check in date: Sunday, 05 October
+          ...
+
+    Works for any website and any parameter set — nothing is hardcoded here.
+    """
+    if not input_parameters:
+        return task
+    lines = []
+    for key, values in input_parameters.items():
+        if values:
+            # Convert underscore keys to readable labels (e.g. check_in_date → check in date)
+            label = key.replace("_", " ")
+            lines.append(f"  {label}: {values[0]}")
+    if not lines:
+        return task
+    return task + "\n\nUse these exact values when filling in any form fields:\n" + "\n".join(lines)
+
+
 def make_agentic_automation(
     start_url: str,
     agentic_task: str,
     input_parameters: dict,
 ) -> dict:
+    # Inject param values into the task so the round-0 agent uses the correct
+    # destination, dates, and personal details instead of inventing its own.
+    task_with_params = _enrich_task_with_params(agentic_task, input_parameters)
     return {
         "url": start_url,
         "parameters": {
@@ -600,7 +635,7 @@ def make_agentic_automation(
                 "type": "action_node",
                 "interaction_action": {
                     "agentic_task": {
-                        "task": agentic_task,
+                        "task": task_with_params,
                         "max_steps": 30,
                         "backend": "browser_use",
                     }
@@ -608,6 +643,165 @@ def make_agentic_automation(
             },
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Task completion evaluator
+# ---------------------------------------------------------------------------
+
+def _get_final_url(task_dir: Path) -> str:
+    """Read the URL the browser was on when the last node finished.
+
+    Walks step dirs in reverse order looking for a state.json with a url field.
+    Falls back to empty string if nothing found.
+    """
+    step_dirs = sorted(
+        task_dir.glob("logs/step_*"),
+        key=lambda p: int(re.search(r"step_(\d+)", str(p)).group(1)) if re.search(r"step_(\d+)", str(p)) else -1,
+        reverse=True,
+    )
+    for step_dir in step_dirs:
+        state_path = step_dir / "state.json"
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(errors="replace"))
+                url = state.get("url", "")
+                if url.startswith("http"):
+                    return url
+            except Exception:
+                pass
+    return ""
+
+
+def _read_top_locator_score(task_dir: Path, node_idx: int) -> int | None:
+    """Return the top stability score from logs/step_N/locator_candidates.json.
+
+    Returns None if the file doesn't exist (non-locator action like scroll/go_to_url).
+    Returns 0 if the file exists but can't be parsed.
+    Score semantics: 0=JS eval failed, 10=xpath-only, >10=semantic attribute found.
+    """
+    candidates_path = task_dir / "logs" / f"step_{node_idx}" / "locator_candidates.json"
+    if not candidates_path.exists():
+        return None  # non-locator action — no element lookup involved
+    try:
+        candidates = json.loads(candidates_path.read_text(errors="replace"))
+        if candidates:
+            return int(candidates[0]["score"])  # list is already sorted best-first
+    except Exception:
+        pass
+    return 0  # file exists but unreadable → treat as worst case
+
+
+def _evaluate_task_completion(
+    original_task: str,
+    automation: dict,
+    outcomes: list[dict],
+    task_dir: Path,
+    trailing_cache_path: Path | None,
+) -> str | None:
+    """Ask the LLM what sub-goals from the original task were NOT completed.
+
+    Builds evidence from three sources:
+    1. What the deterministic automation nodes were supposed to do
+       (their prompt_instructions tell us what each node covers).
+    2. What the trailing agentic agent actually did
+       (its action cache lists the actions it took).
+    3. The final URL the browser reached.
+
+    Returns a short string of missed goals (one per line), or None if
+    everything was achieved. The caller appends this to the next round's
+    trailing agentic task so it explicitly fixes the gaps.
+    """
+    # --- Collect what the deterministic nodes cover ---
+    # Each node's prompt_instructions describes its intent. Gathering them
+    # gives the LLM a picture of what was already handled deterministically.
+    covered_steps = []
+    for node in automation.get("nodes", []):
+        ia = node.get("interaction_action", {})
+        for atype in ("click_element", "input_text", "select_option", "scroll", "go_to_url"):
+            action = ia.get(atype)
+            if isinstance(action, dict):
+                hint = action.get("prompt_instructions", "")
+                if hint:
+                    covered_steps.append(hint)
+                break
+
+    # --- Collect what the trailing agentic actually did ---
+    # The trailing agentic's action cache shows every action it took,
+    # giving us concrete evidence of what it explored vs skipped.
+    agentic_actions = []
+    if trailing_cache_path and trailing_cache_path.exists():
+        try:
+            cache_data = json.loads(trailing_cache_path.read_text(errors="replace"))
+            for act in cache_data.get("deterministic_actions_list", [])[:15]:
+                atype = act.get("action_type", "")
+                ax = (act.get("element") or {}).get("ax_name", "")
+                text = act.get("action_params", {}).get("text", "")
+                desc = f"{atype}"
+                if ax:
+                    desc += f" on '{ax}'"
+                if text:
+                    desc += f" → '{text[:40]}'"
+                agentic_actions.append(desc)
+        except Exception:
+            pass
+
+    final_url = _get_final_url(task_dir)
+    summary = outcomes_summary(outcomes)
+
+    # --- Build evaluation prompt ---
+    covered_str = "\n".join(f"  - {s}" for s in covered_steps) if covered_steps else "  (none)"
+    agentic_str = "\n".join(f"  - {a}" for a in agentic_actions) if agentic_actions else "  (none — agent did nothing)"
+
+    prompt = f"""A browser automation ran with this goal:
+"{original_task}"
+
+What the deterministic automation nodes covered:
+{covered_str}
+
+What the trailing agentic agent did this round:
+{agentic_str}
+
+Final URL reached: {final_url}
+Node outcomes: {summary}
+
+List ONLY the specific sub-goals from the original task that were clearly NOT completed.
+One line per missed goal. Be concrete and brief (e.g. "sort results by price before selecting hotel").
+If all goals were achieved, respond with exactly: COMPLETE"""
+
+    try:
+        import litellm, os, time as _time
+        model = os.environ.get("LLM_MODEL", "openai/gpt-4.1")
+        api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+
+        # Wait for the token-per-minute window to partially reset before calling.
+        # The trailing agentic often exhausts the TPM budget; a brief pause lets
+        # the rate-limit counter roll over so this evaluation call succeeds.
+        _time.sleep(15)
+
+        resp = litellm.completion(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You evaluate browser automation task completion. Be concise."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=300,
+            api_key=api_key,
+        )
+        result = (resp.choices[0].message.content or "").strip()
+        if result.upper() == "COMPLETE" or not result:
+            logger.info("Task completion check: all goals achieved.")
+            return None
+        logger.info(f"Task completion check — missed goals:\n{result}")
+        return result
+    except Exception as e:
+        # Non-critical — if evaluation fails, proceed without enrichment.
+        # Log the full error type so we can diagnose rate limits or API errors.
+        import traceback
+        logger.warning(f"Task completion evaluation failed ({type(e).__name__}): {e}")
+        logger.debug(f"Task completion evaluation traceback:\n{traceback.format_exc()}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +940,7 @@ def run_loop(
         # We do NOT require command_success on every node — prompt_fallback nodes
         # reliably work via LLM locator and would never reach command_success, causing
         # an infinite loop if we insisted on it.
+        
         trailing_agentic_done = new_det_actions == 0 and result.get("status") == "success"
         if round_num > 0 and trailing_agentic_done:
             logger.info(f"Converged at round {round_num}: trailing agentic idle, task succeeded.")
@@ -846,23 +1041,87 @@ def run_loop(
             next_auto["nodes"] = nodes
 
         # --- Enforce max_tries on all nodes ---
-        # Proven nodes → max_tries=10 (reliable; let the command layer fully run)
-        # Unproven nodes → max_tries=2 (fail fast → prompt/agentic takes over)
-        # Always set regardless of whether the LLM included the field.
+        # Proven nodes get max_tries=10 only if their locator is stable (score>10).
+        # score=0: locator.evaluate() failed, stability unknown.
+        # score=10: xpath-only, breaks on any DOM reorder.
+        # score>10: semantic attribute (id, aria-label, placeholder…), safe to promote.
+        # score=None: no locator_candidates.json → non-locator action (scroll, go_to_url…)
+        #             → always stable, promote freely.
         proven_set = {"command_success", "deterministic", "skipped"}
         proven_indices = {o["node"] for o in outcomes if o["outcome"] in proven_set}
+        outcome_by_node = {o["node"]: o["outcome"] for o in outcomes}
         for node_idx, node in enumerate(next_auto.get("nodes", [])):
             ia = node.get("interaction_action", {})
             if "agentic_task" in ia:
-                continue  # don't touch agentic nodes
-            ia["max_tries"] = 10 if node_idx in proven_indices else 2
+                continue
+            if node_idx in proven_indices:
+                top_score = _read_top_locator_score(task_dir, node_idx)
+                # command_success should always produce a candidates file.
+                # If it's missing, locator_from_playwright was caught by handle_command's
+                # outer guard — no stability signal, so don't promote.
+                if top_score is None and outcome_by_node.get(node_idx) == "command_success":
+                    top_score = 0
+                ia["max_tries"] = 10 if (top_score is None or top_score > 10) else 2
+            else:
+                ia["max_tries"] = 2
+
+        # --- Evaluate task quality: did the automation achieve all sub-goals? ---
+        # After each round (not just mechanical failures), ask the LLM whether
+        # every sub-goal of the original vague task was actually carried out.
+        # If anything was missed (e.g. "sort by price" skipped), the missed goals
+        # are appended to the next trailing agentic task so the agent self-corrects
+        # without the user having to spell out every step upfront.
+        #
+        # trailing_cache_path is the last agentic step's cache — it shows what
+        # the trailing agent did, so the evaluator can compare intent vs. action.
+        trailing_cache_path = find_latest_cache(task_dir)
+        missed_goals = _evaluate_task_completion(
+            original_task=agentic_task,
+            automation=next_auto,
+            outcomes=outcomes,
+            task_dir=task_dir,
+            trailing_cache_path=trailing_cache_path,
+        )
+
+        # Build the effective task for the next round's trailing agentic.
+        #
+        # Layer 1 — always: inject the resolved input parameter values so the agent
+        # knows exactly which city, dates, and personal details to use.  Without this
+        # the agent invents values every run (e.g. "New Delhi" instead of "Gurgaon").
+        # _enrich_task_with_params is generalized — it works for any param set.
+        task_with_params = _enrich_task_with_params(agentic_task, input_parameters)
+
+        # Layer 2 — when the quality evaluator found missed sub-goals: append them
+        # so the agent explicitly retries what it skipped last round (e.g. "sort by price").
+        # The original task is preserved; everything here is additive.
+        if missed_goals:
+            enriched_task = (
+                f"{task_with_params}\n\n"
+                f"Previous run missed these goals — make sure to complete them:\n"
+                f"{missed_goals}"
+            )
+            logger.info(f"Task enriched for next round with missed goals:\n{missed_goals}")
+
+            # Write evolution log so the user can see what the system learned each round
+            evolution_path = output_dir / "task_evolution.json"
+            try:
+                evolution = json.loads(evolution_path.read_text()) if evolution_path.exists() else []
+            except Exception:
+                evolution = []
+            evolution.append({"round": round_num, "missed_goals": missed_goals.splitlines()})
+            with open(evolution_path, "w") as f:
+                json.dump(evolution, f, indent=2)
+        else:
+            enriched_task = task_with_params
 
         # --- Append trailing agentic node ---
+        # Uses enriched_task (params always injected + missed goals if any)
+        # so the agent has concrete values and explicit retry instructions.
         trailing_node = {
             "type": "action_node",
             "interaction_action": {
                 "agentic_task": {
-                    "task": agentic_task,
+                    "task": enriched_task,
                     "max_steps": 20,
                     "backend": "browser_use",
                 }
