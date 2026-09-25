@@ -34,6 +34,8 @@ from optexity.inference.core.logging import (
     save_trajectory_in_server,
     start_task_in_server,
 )
+from optexity.schema.automation import Automation
+
 from optexity.inference.infra.actual_browser import ActualBrowser
 from optexity.inference.infra.browser_health import consume_browser_restart_request
 from optexity.schema.enums import ExitCodes
@@ -260,6 +262,8 @@ async def run_automation_in_process(
             f"Starting worker attempt {attempt_index + 1}/{total_attempts} (attempts_left={attempts_left})"
         )
 
+        worker_stderr_path = task.logs_directory / "worker_stderr.log"
+        worker_stderr_file = open(worker_stderr_path, "w")
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
             worker_path,
@@ -269,6 +273,8 @@ async def run_automation_in_process(
             str(_cdp_url),
             str(attempts_left),
             preexec_fn=os.setsid,
+            stderr=worker_stderr_file,
+            stdout=worker_stderr_file,
             env={
                 **os.environ,
                 "CHILD_FASTAPI_PORT": str(_child_fastapi_port),
@@ -283,6 +289,10 @@ async def run_automation_in_process(
                 returncode = await asyncio.wait_for(
                     proc.wait(), timeout=task.max_timeout_in_minutes * 60
                 )
+                worker_stderr_file.close()
+                stderr_content = worker_stderr_path.read_text()
+                if stderr_content:
+                    logger.info(f"Worker stderr/stdout:\n{stderr_content}")
                 logger.info(f"Worker finished with return code {returncode}")
             except asyncio.TimeoutError:
                 logger.info(
@@ -581,6 +591,27 @@ async def task_processor():
                 fetch_success = task.automation is not None
                 if not fetch_success:
                     automation_error = "Task allocated without an automation"
+
+
+            # with open("test_automation.json", "r") as f:
+            #     automation = json.load(f)
+            #     automation = Automation.model_validate(automation)
+            # task.automation = automation
+
+            override_env = os.environ.get("OPTEXITY_LOCAL_AUTOMATION", "test_automation.json")
+            if override_env:
+                try:
+                    override_path = pathlib.Path(override_env)
+                    if override_path.exists():
+                        from optexity.schema.automation import Automation
+                        with open(override_path, "r") as f:
+                            override_data = json.load(f)
+                            automation_obj = Automation.model_validate(override_data)
+                        task.automation = automation_obj
+                        fetch_success = True
+                        logger.info(f"[LOCAL OVERRIDE] Loaded automation from {override_path}")
+                except Exception as override_err:
+                    logger.error(f"[LOCAL OVERRIDE] Failed to load {override_env}: {override_err}")
 
             if not fetch_success:
                 logger.error(

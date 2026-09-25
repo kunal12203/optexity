@@ -216,3 +216,20 @@ node_modules
 optexity/utils/optexity.code-workspace
 
 tmp
+# Handover and local test files
+HANDOVER.md
+agentic_booking.json
+
+# Test artifacts and generated automation files
+test_automation*.json
+action_cache*.json
+booking_cached_*.json
+booking_params.json
+saucedemo_params.json
+makemytrip_*.json
+mmt_loop_output*/
+iterative_loop.py
+payload.json
+run_agentic_task.py
+run_server.sh
+test_form.html
