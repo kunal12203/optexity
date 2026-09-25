@@ -87,7 +87,9 @@ def _get_focused_schema() -> str:
 
 def _resolve_model() -> str:
     import os
-    env_model = os.environ.get("LLM_MODEL")
+    # Converter/improver needs a strong reasoning model — separate from the
+    # browser agent model so we can use a cheap model for agentic steps.
+    env_model = os.environ.get("LLM_CONVERTER_MODEL") or os.environ.get("LLM_MODEL")
     if env_model:
         return env_model
     try:
@@ -150,9 +152,28 @@ def _extract_json(text: str) -> dict | None:
 
 
 def _semantic_check(data: dict, input_parameters: dict | None = None) -> str | None:
-    """Check for issues that pass schema validation but break at runtime."""
+    """Catch issues that pass Pydantic schema validation but break at runtime.
+
+    Two classes of error are detected:
+
+    1. `page.` prefix on a command — the runtime already prepends `page.` before
+       executing every locator, so writing it yourself produces `page.page.locator(…)`
+       which always throws a runtime AttributeError.
+
+    2. Plain-string `input_text` value with no `{…}` reference — any text typed into
+       a form field should come from a parameter reference like `{destination_city[0]}`
+       so the automation works for different inputs on every run.  If the LLM wrote a
+       literal string (e.g. "New Delhi", "John") the automation is effectively hardcoded
+       to that exact value and will silently produce wrong results for other inputs.
+       We flag ALL plain-string input_text values, not just ones that happen to match a
+       known param value, because the LLM can invent values that don't appear in params
+       at all (as demonstrated by "New Delhi" when the param was "Gurgaon").
+    """
     errors = []
     params = input_parameters or {}
+
+    # Build the set of known param values for the legacy substring match below.
+    # Kept for context in error messages but the primary check no longer depends on it.
     param_values = set()
     for vals in params.values():
         if isinstance(vals, list):
@@ -166,16 +187,36 @@ def _semantic_check(data: dict, input_parameters: dict | None = None) -> str | N
             action = ia.get(action_type)
             if not isinstance(action, dict):
                 continue
+
+            # --- Check 1: page. prefix ---
             cmd = action.get("command", "")
             if cmd.startswith("page."):
-                errors.append(f"Node {i}: command starts with 'page.' — remove it, runtime prepends page. automatically.")
-            text = action.get("input_text", "")
-            if text and "{" not in text and param_values:
-                text_lower = text.lower()
-                for pv in param_values:
-                    if pv in text_lower or text_lower in pv:
-                        errors.append(f"Node {i}: input_text '{text}' looks like a param value but is hardcoded — use {{key[index]}} ref.")
-                        break
+                errors.append(
+                    f"Node {i}: command starts with 'page.' — remove it, "
+                    "runtime prepends page. automatically."
+                )
+
+            # --- Check 2: plain-string input_text (no param reference) ---
+            # Only applies to input_text nodes because those are the fields where
+            # user-supplied values (city, name, date…) must vary per run.
+            # click_element / key_press values are UI labels, not user data.
+            if action_type == "input_text":
+                text = action.get("input_text", "")
+                if text and "{" not in text:
+                    # Provide a hint toward the most likely intended param if we can
+                    # find a substring match — helps the LLM repair on the next retry.
+                    hint = ""
+                    if param_values:
+                        text_lower = text.lower()
+                        for pv in param_values:
+                            if pv in text_lower or text_lower in pv:
+                                hint = f" (looks like param value '{text}' — use {{key[index]}} ref)"
+                                break
+                    if not hint:
+                        hint = " (use a {key[index]} param reference instead of a literal string)"
+                    errors.append(
+                        f"Node {i}: input_text '{text}' is hardcoded{hint}"
+                    )
 
     if errors:
         return " | ".join(errors[:5])
@@ -355,8 +396,12 @@ def _build_convert_prompt(
    Priority: data-testid > id > name > placeholder > role+ax_name > aria-label > xpath. Append `.nth(0)` when multiple matches.
 
 ### Variables
-5. NEVER hardcode param values. Use {{key[index]}} refs everywhere. When `param_ref` is present, use it exactly.
-   If the typed text doesn't match any param but the field name suggests a param (e.g. field "04lastname" → last_name), use the param ref anyway.
+5. Every `input_text` value MUST be a `{{key[index]}}` reference — never a plain string.
+   This applies even when the agent recorded a specific value (e.g. "New Delhi") that
+   doesn't appear in the param list: you must still map it to the closest parameter by
+   field intent (e.g. destination field → {{destination_city[0]}}, check-in → {{check_in_date[0]}}).
+   When `param_ref` is present in the action summary, use it exactly.
+   Literal `input_text` strings will be rejected by the validator.
 6. Date-pickers/calendar cells: set `skip_command: true`, use param refs in `prompt_instructions`.
 
 ### Type mapping
